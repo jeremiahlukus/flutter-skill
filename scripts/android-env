@@ -1,0 +1,1432 @@
+#!/bin/bash
+
+# Configuration
+VERSION="1.0.0"
+
+# Fail loudly instead of silently continuing past a broken step.
+set -o pipefail
+
+# How this script refers to itself in messages. Once installed on PATH it is
+# invoked as a bare command, so "./" would be wrong; before that it is not on
+# PATH, so "./" is required.
+SELF_NAME=$(basename "$0")
+if command -v "$SELF_NAME" > /dev/null 2>&1; then
+    SELF="$SELF_NAME"
+else
+    SELF="./$SELF_NAME"
+fi
+
+# ---------------------------------------------------------------------------
+# Which command-line tools build to install. Adjustable, highest precedence
+# first:
+#
+#   ANDROID_CMDLINE_TOOLS_URL=<url>      use this archive verbatim
+#   ANDROID_CMDLINE_TOOLS_BUILD=<n>      use this build number (e.g. 13114758)
+#   ANDROID_CMDLINE_TOOLS_PIN=1          use CMD_TOOLS_BUILD_PIN, no network
+#   (default)                            newest stable build for this host,
+#                                        read from Google's SDK index
+#
+#   ANDROID_CMDLINE_TOOLS_UPGRADE=1      reinstall even if already present
+#
+# Run './android-env tools' to see what would be downloaded.
+#
+# The pin below is only a fallback for when the index is unreachable. Pinning
+# a build is what made the original script install rev 12.0 and then emit
+# "SDK XML versions up to 3 but ... version 4 was encountered" against a
+# newer SDK.
+CMD_TOOLS_BUILD_PIN="16111833"
+SDK_REPO_URL="https://dl.google.com/android/repository/repository2-3.xml"
+# ---------------------------------------------------------------------------
+
+# Detect OS and set paths. CMD_TOOLS_HOST is the token Google uses in the
+# archive filename; it encodes OS and, on macOS, CPU architecture.
+#
+# A pre-set ANDROID_HOME (or ANDROID_SDK_ROOT) wins, per the usual Android
+# convention; ANDROID_HOME_DEFAULT is the per-OS fallback.
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    OS_NAME="macOS"
+    ANDROID_HOME_DEFAULT="$HOME/Library/Android/sdk"
+    # macOS archives are architecture-split from rev 22.0 onward. There is no
+    # plain "commandlinetools-mac-<build>" for current builds - it 404s.
+    if [[ $(uname -m) == "arm64" ]]; then
+        CMD_TOOLS_HOST="mac_arm64"
+    else
+        CMD_TOOLS_HOST="mac_x86_64"
+    fi
+    CMD_TOOLS_HOST_LEGACY="mac"
+elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
+    OS_NAME="Windows"
+    ANDROID_HOME_DEFAULT="$HOME/AppData/Local/Android/Sdk"
+    CMD_TOOLS_HOST="win"
+    CMD_TOOLS_HOST_LEGACY="win"
+else
+    OS_NAME="Linux"
+    ANDROID_HOME_DEFAULT="$HOME/Android/Sdk"
+    CMD_TOOLS_HOST="linux"
+    CMD_TOOLS_HOST_LEGACY="linux"
+fi
+
+ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$ANDROID_HOME_DEFAULT}}"
+
+# Export so the SDK tools agree with us on which SDK they are managing.
+export ANDROID_HOME
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+
+# Make sure tools in PATH during execution
+export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$PATH"
+
+# Set proper executable names for Windows
+if [[ "$OS_NAME" == "Windows" ]]; then
+    SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager.bat"
+    AVDMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager.bat"
+    EMULATOR="emulator.exe"
+    ADB="adb.exe"
+    AVD_HOME="${ANDROID_AVD_HOME:-$USERPROFILE/.android/avd}"
+else
+    SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+    AVDMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager"
+    EMULATOR="emulator"
+    ADB="adb"
+    AVD_HOME="${ANDROID_AVD_HOME:-$HOME/.android/avd}"
+fi
+
+# Always address the binaries by absolute path so a different Android SDK
+# already on PATH (Homebrew, Android Studio, asdf, ...) cannot shadow ours.
+EMULATOR_BIN="$ANDROID_HOME/emulator/$EMULATOR"
+ADB_BIN="$ANDROID_HOME/platform-tools/$ADB"
+
+# ---------------------------------------------------------------------------
+# Unattended operation. Set these to drive the tool from a script, CI job or
+# an MCP server, where there is nobody to answer a prompt:
+#
+#   ANDROID_ENV_YES=1              never prompt; take the documented default
+#   ANDROID_ENV_AVD_NAME=<name>    emulator name for setup, instead of asking
+#   ANDROID_ENV_PROFILE=1|2|3      device profile for setup, instead of asking
+#   ANDROID_ENV_BOOT_TIMEOUT=<s>   how long `start --wait` and `ensure` wait
+#                                  for the emulator to report booted (default 300)
+#
+# Every prompt in this script checks noninteractive() first.
+ANDROID_ENV_YES="${ANDROID_ENV_YES:-0}"
+ANDROID_ENV_BOOT_TIMEOUT="${ANDROID_ENV_BOOT_TIMEOUT:-300}"
+# wait_for_boot runs in a subshell, so it reports elapsed time through a file.
+WAIT_WAITED_FILE="${TMPDIR:-/tmp}/android-env-wait.$$"
+
+function noninteractive() {
+    [ "$ANDROID_ENV_YES" = "1" ] && return 0
+    # No usable stdin (piped, redirected from /dev/null, or no tty) also means
+    # nobody can answer, so do not hang waiting.
+    [ -t 0 ] || return 0
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+
+# Records which build this script installed, so upgrades can be detected.
+CMD_TOOLS_MARKER="$ANDROID_HOME/cmdline-tools/latest/.oneclick-build"
+
+# The Android CLI ships with cmdline-tools rev 23+ and replaces sdkmanager,
+# which is deprecated there and merely delegates to it. Preferred because it
+# accepts --no-metrics (sdkmanager rejects the flag outright) and accepts
+# licences without a `yes |` pipe. Set ANDROID_ENV_USE_SDKMANAGER=1 to force
+# the legacy path.
+ANDROID_CLI="$ANDROID_HOME/cmdline-tools/latest/bin/android"
+SDK_INSTALL_LOG="$ANDROID_HOME/.oneclick-sdk-install.log"
+
+# Colors
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+function die() {
+    echo -e "\n${RED}✗ $1${NC}" >&2
+    exit 1
+}
+
+function warn() {
+    echo -e "${YELLOW}! $1${NC}" >&2
+}
+
+function print_header() {
+    echo -e "${GREEN}╭────────────────────────────────────────────────────────╮${NC}"
+    echo -e "${GREEN}│                                                        │${NC}"
+    echo -e "${GREEN}│       🚀 Welcome to OneClick Android Emulator 🚀       │${NC}"
+    echo -e "${GREEN}│                                                        │${NC}"
+    echo -e "${GREEN}╰────────────────────────────────────────────────────────╯${NC}"
+    echo ""
+}
+
+function show_help() {
+    print_header
+    echo "Usage: $SELF_NAME <command>"
+    echo ""
+    echo "Commands:"
+    echo "  setup     Install Android SDK, Platform Tools, and Emulator"
+    echo "  doctor    Check environment status and missing dependencies"
+    echo "  list      List available Android Virtual Devices (AVDs)"
+    echo "  start     Start an emulator. --wait blocks until it has booted"
+    echo "  stop      Stop a running emulator (all of them if none is named)"
+    echo "  ensure    Guarantee a booted emulator, provisioning if needed (--json)"
+    echo "  delete    Delete an emulator and its desktop shortcut"
+    echo "  tools     Show installed vs. available command-line tools"
+    echo "  install   Put this script on your PATH so it runs from anywhere"
+    echo "  uninstall Remove it from your PATH"
+    echo "  version   Show version"
+    echo ""
+}
+
+function check_command() {
+    if command -v "$1" &> /dev/null; then
+        echo -e "${GREEN}✓ $1 found${NC}"
+        return 0
+    else
+        echo -e "${RED}✗ $1 not found${NC}"
+        return 1
+    fi
+}
+
+# Verify everything setup depends on before we download a single byte.
+function require_prerequisites() {
+    local missing=""
+    local cmd
+    for cmd in curl unzip git java; do
+        command -v "$cmd" &> /dev/null || missing="$missing $cmd"
+    done
+    if [ -n "$missing" ]; then
+        die "Missing required tool(s):$missing
+Install them and re-run. Java (JDK 17+) is required by sdkmanager/avdmanager."
+    fi
+    echo -e "${GREEN}✓ curl, unzip, git and java found${NC}"
+}
+
+# List AVD names straight from the AVD home. Works before the SDK is
+# installed and needs neither Java nor avdmanager.
+function list_avd_names() {
+    [ -d "$AVD_HOME" ] || return 0
+    local f name
+    for f in "$AVD_HOME"/*.ini; do
+        [ -e "$f" ] || continue
+        name=$(basename "$f" .ini)
+        printf '%s\n' "$name"
+    done
+}
+
+# True if an AVD exists. Deliberately avoids `list_avd_names | grep -q`:
+# grep -q exits on first match, the writer gets SIGPIPE, and pipefail then
+# reports the whole pipeline as failed even though the name matched.
+function avd_exists() {
+    [ -f "$AVD_HOME/$1.ini" ]
+}
+
+# Replace a key in an ini file (or append it), matching the file's own
+# no-spaces-around-equals convention.
+function set_ini_key() {
+    local file=$1 key=$2 value=$3
+    local key_re="${key//./\\.}"
+    local tmp="${file}.tmp.$$"
+
+    grep -v "^[[:space:]]*${key_re}[[:space:]]*=" "$file" > "$tmp" 2>/dev/null || true
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+
+    if [ -s "$tmp" ]; then
+        mv "$tmp" "$file"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+function do_doctor() {
+    echo -e "\n${YELLOW}Android Environment Doctor${NC}\n"
+
+    check_command "java"
+
+    if [ -d "$ANDROID_HOME" ]; then
+        echo -e "${GREEN}✓ ANDROID_HOME ($ANDROID_HOME)${NC}"
+    else
+        echo -e "${RED}✗ ANDROID_HOME not found ($ANDROID_HOME)${NC}"
+    fi
+
+    if [ -x "$SDKMANAGER" ]; then
+        local rev build
+        rev=$(installed_cmd_tools_rev || true)
+        build=""
+        [ -f "$CMD_TOOLS_MARKER" ] && build=$(cat "$CMD_TOOLS_MARKER" 2>/dev/null)
+        if [ -n "$build" ]; then
+            echo -e "${GREEN}✓ sdkmanager found (cmdline-tools rev ${rev:-unknown}, build $build)${NC}"
+        else
+            echo -e "${GREEN}✓ sdkmanager found (cmdline-tools rev ${rev:-unknown})${NC}"
+        fi
+        echo "  (run '$SELF tools' to compare against the newest build)"
+    else
+        echo -e "${RED}✗ sdkmanager not found ($SDKMANAGER)${NC}"
+    fi
+
+    if [ -x "$ANDROID_CLI" ]; then
+        local cli_ver
+        cli_ver=$("$ANDROID_CLI" --no-metrics info 2>/dev/null | awk -F': ' '/^version:/{print $2; exit}')
+        echo -e "${GREEN}✓ android CLI found (version ${cli_ver:-unknown}) - used instead of sdkmanager${NC}"
+    else
+        echo -e "${YELLOW}! android CLI not present (cmdline-tools rev 23+); sdkmanager will be used${NC}"
+    fi
+
+    if [ -x "$AVDMANAGER" ]; then
+        echo -e "${GREEN}✓ avdmanager found${NC}"
+    else
+        echo -e "${RED}✗ avdmanager not found ($AVDMANAGER)${NC}"
+    fi
+
+    if [ -x "$EMULATOR_BIN" ]; then
+        echo -e "${GREEN}✓ emulator found${NC}"
+    else
+        echo -e "${RED}✗ emulator not found ($EMULATOR_BIN)${NC}"
+    fi
+
+    if [ -x "$ADB_BIN" ]; then
+        echo -e "${GREEN}✓ adb found ($("$ADB_BIN" --version 2>/dev/null | head -n 1))${NC}"
+    else
+        echo -e "${RED}✗ adb not found ($ADB_BIN)${NC}"
+    fi
+
+    # Warn when another SDK's tools would win a bare PATH lookup.
+    local path_sdkmanager
+    path_sdkmanager=$(command -v sdkmanager 2>/dev/null || true)
+    if [ -n "$path_sdkmanager" ] && [ "$path_sdkmanager" != "$SDKMANAGER" ]; then
+        warn "A different sdkmanager is also on your PATH: $path_sdkmanager"
+        warn "This script only ever uses $ANDROID_HOME"
+    fi
+
+    echo -e "\n${YELLOW}Installed AVDs:${NC}"
+    local avds
+    avds=$(list_avd_names)
+    if [ -n "$avds" ]; then
+        echo -e "${GREEN}$avds${NC}"
+    else
+        echo "None found in $AVD_HOME"
+    fi
+    echo ""
+}
+
+# Installs SDK packages through the Android CLI when available, else
+# sdkmanager. Package ids are passed in sdkmanager form (semicolons); the
+# Android CLI documents slashes, so they are converted at call time.
+#
+# Both tools exit 0 even when a package does not exist - they only print
+# "Package X not found." - so the output is inspected as well, and
+# verify_sdk_packages() confirms the result on disk.
+function sdk_install() {
+    local pkgs=("$@")
+    local code p
+
+    if [ -x "$ANDROID_CLI" ] && [ "${ANDROID_ENV_USE_SDKMANAGER:-0}" != "1" ]; then
+        local cli_pkgs=()
+        for p in "${pkgs[@]}"; do
+            cli_pkgs+=("${p//;//}")
+        done
+        echo "Installer: Android CLI (--no-metrics)"
+        echo "Packages:  ${cli_pkgs[*]}"
+        "$ANDROID_CLI" --no-metrics --sdk="$ANDROID_HOME" sdk install "${cli_pkgs[@]}" \
+            < /dev/null 2>&1 | tee "$SDK_INSTALL_LOG"
+        code=${PIPESTATUS[0]}
+        if grep -q 'not found' "$SDK_INSTALL_LOG" 2>/dev/null; then
+            die "The Android CLI could not find a requested package.
+See $SDK_INSTALL_LOG"
+        fi
+        [ "$code" -eq 0 ] || die "Android CLI failed to install SDK packages (exit $code).
+See $SDK_INSTALL_LOG"
+        return 0
+    fi
+
+    echo "Installer: sdkmanager (legacy)"
+    echo "Packages:  ${pkgs[*]}"
+    echo "Accepting SDK Licenses (Automated)..."
+    # sdkmanager exits non-zero once stdin closes, so its status is not useful
+    # here; the install below is the real test of whether licences took.
+    yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses > /dev/null 2>&1
+
+    "$SDKMANAGER" --sdk_root="$ANDROID_HOME" "${pkgs[@]}" 2>&1 | tee "$SDK_INSTALL_LOG"
+    code=${PIPESTATUS[0]}
+    if grep -qiE 'not found|Failed to find package' "$SDK_INSTALL_LOG" 2>/dev/null; then
+        die "sdkmanager could not find a requested package.
+See $SDK_INSTALL_LOG"
+    fi
+    [ "$code" -eq 0 ] || die "sdkmanager failed to install SDK packages (exit $code).
+See $SDK_INSTALL_LOG"
+}
+
+# Confirm on disk what the installer claimed to do, since neither installer
+# reports a missing package through its exit code.
+function verify_sdk_packages() {
+    local sys_image_path="${SYS_IMAGE//;//}"
+    local missing=""
+
+    [ -x "$ADB_BIN" ]                                  || missing="$missing platform-tools"
+    [ -x "$EMULATOR_BIN" ]                             || missing="$missing emulator"
+    [ -d "$ANDROID_HOME/platforms/android-34" ]        || missing="$missing platforms/android-34"
+    [ -d "$ANDROID_HOME/$sys_image_path" ]             || missing="$missing $sys_image_path"
+
+    if [ -n "$missing" ]; then
+        die "These SDK packages are missing after install:$missing
+See $SDK_INSTALL_LOG"
+    fi
+    echo -e "${GREEN}✓ SDK packages verified on disk${NC}"
+}
+
+function cmd_tools_archive_url() {
+    printf 'https://dl.google.com/android/repository/commandlinetools-%s-%s_latest.zip' "$1" "$2"
+}
+
+# Pkg.Revision of the currently installed tools, if any.
+function installed_cmd_tools_rev() {
+    local sp="$ANDROID_HOME/cmdline-tools/latest/source.properties"
+    [ -f "$sp" ] || return 1
+    awk -F= '/^Pkg\.Revision=/{print $2; exit}' "$sp"
+}
+
+# Newest stable build for this host, from Google's package index. The host
+# token already encodes OS and architecture, so the filenames alone are
+# enough - no need to parse host-os/host-arch out of the XML.
+function latest_cmd_tools_build() {
+    curl -fsS --max-time 20 "$SDK_REPO_URL" 2>/dev/null \
+        | grep -oE "commandlinetools-${CMD_TOOLS_HOST}-[0-9]+_latest\.zip" \
+        | grep -oE '[0-9]+' \
+        | sort -n \
+        | tail -n 1
+}
+
+# Sets CMD_TOOLS_BUILD, CMD_TOOLS_URL and CMD_TOOLS_SOURCE.
+function resolve_cmd_tools() {
+    if [ -n "${ANDROID_CMDLINE_TOOLS_URL:-}" ]; then
+        CMD_TOOLS_URL="$ANDROID_CMDLINE_TOOLS_URL"
+        CMD_TOOLS_BUILD=$(printf '%s' "$CMD_TOOLS_URL" | grep -oE '[0-9]{6,}' | tail -n 1)
+        CMD_TOOLS_SOURCE="ANDROID_CMDLINE_TOOLS_URL"
+        return 0
+    fi
+
+    if [ -n "${ANDROID_CMDLINE_TOOLS_BUILD:-}" ]; then
+        CMD_TOOLS_BUILD="$ANDROID_CMDLINE_TOOLS_BUILD"
+        CMD_TOOLS_SOURCE="ANDROID_CMDLINE_TOOLS_BUILD"
+    elif [ "${ANDROID_CMDLINE_TOOLS_PIN:-0}" = "1" ]; then
+        CMD_TOOLS_BUILD="$CMD_TOOLS_BUILD_PIN"
+        CMD_TOOLS_SOURCE="built-in pin (ANDROID_CMDLINE_TOOLS_PIN=1)"
+    else
+        CMD_TOOLS_BUILD=$(latest_cmd_tools_build)
+        if [ -n "$CMD_TOOLS_BUILD" ]; then
+            CMD_TOOLS_SOURCE="newest stable in Google's SDK index"
+        else
+            CMD_TOOLS_BUILD="$CMD_TOOLS_BUILD_PIN"
+            CMD_TOOLS_SOURCE="built-in pin (SDK index unreachable)"
+        fi
+    fi
+
+    CMD_TOOLS_URL=$(cmd_tools_archive_url "$CMD_TOOLS_HOST" "$CMD_TOOLS_BUILD")
+
+    # Builds before rev 22.0 only ship the un-split "mac" archive, so an
+    # explicitly requested older build needs the legacy filename. Skipped for
+    # ANDROID_CMDLINE_TOOLS_PIN=1, which must not touch the network.
+    if [ "${ANDROID_CMDLINE_TOOLS_PIN:-0}" != "1" ] \
+        && [ "$CMD_TOOLS_HOST" != "$CMD_TOOLS_HOST_LEGACY" ] \
+        && ! curl -fsIL --max-time 15 -o /dev/null "$CMD_TOOLS_URL" 2>/dev/null; then
+        local legacy
+        legacy=$(cmd_tools_archive_url "$CMD_TOOLS_HOST_LEGACY" "$CMD_TOOLS_BUILD")
+        if curl -fsIL --max-time 15 -o /dev/null "$legacy" 2>/dev/null; then
+            CMD_TOOLS_URL="$legacy"
+            CMD_TOOLS_SOURCE="$CMD_TOOLS_SOURCE, legacy filename"
+        fi
+    fi
+}
+
+function install_cmdline_tools() {
+    mkdir -p "$ANDROID_HOME/cmdline-tools" || die "Cannot create $ANDROID_HOME/cmdline-tools"
+
+    local installed_rev installed_build
+    installed_rev=$(installed_cmd_tools_rev || true)
+
+    if [ -x "$SDKMANAGER" ] && [ "${ANDROID_CMDLINE_TOOLS_UPGRADE:-0}" != "1" ]; then
+        echo -e "${GREEN}✓ Command Line Tools already installed (rev ${installed_rev:-unknown})${NC}"
+        resolve_cmd_tools
+        installed_build=""
+        [ -f "$CMD_TOOLS_MARKER" ] && installed_build=$(cat "$CMD_TOOLS_MARKER" 2>/dev/null)
+        if [ -n "$installed_build" ] && [ -n "$CMD_TOOLS_BUILD" ] \
+            && [ "$installed_build" -lt "$CMD_TOOLS_BUILD" ] 2>/dev/null; then
+            warn "A newer build is available ($installed_build -> $CMD_TOOLS_BUILD)."
+            warn "Upgrade with: ANDROID_CMDLINE_TOOLS_UPGRADE=1 $SELF setup"
+        elif [ -z "$installed_build" ]; then
+            warn "This install predates build tracking, so its age cannot be compared."
+            warn "Newest available is build $CMD_TOOLS_BUILD. Upgrade with:"
+            warn "  ANDROID_CMDLINE_TOOLS_UPGRADE=1 $SELF setup"
+        fi
+        return 0
+    fi
+
+    resolve_cmd_tools
+    [ -n "$CMD_TOOLS_BUILD" ] || die "Could not determine a command-line tools build to install."
+
+    local zip="$ANDROID_HOME/cmdline-tools.zip"
+    local tmp="$ANDROID_HOME/cmdline-tools-temp"
+    local dest="$ANDROID_HOME/cmdline-tools/latest"
+    local backup=""
+
+    if [ -n "$installed_rev" ]; then
+        echo "Upgrading command-line tools (rev $installed_rev -> build $CMD_TOOLS_BUILD)..."
+    else
+        echo "Downloading Android Command Line Tools (build $CMD_TOOLS_BUILD, ~130 MB)..."
+    fi
+    echo "Source: $CMD_TOOLS_SOURCE"
+    echo "URL:    $CMD_TOOLS_URL"
+
+    rm -f "$zip"
+    curl -fL --progress-bar -o "$zip" "$CMD_TOOLS_URL" \
+        || die "Download failed: $CMD_TOOLS_URL"
+
+    unzip -tq "$zip" > /dev/null 2>&1 \
+        || die "Downloaded archive is not a valid zip. Delete $zip and retry."
+
+    echo "Extracting tools..."
+    rm -rf "$tmp"
+    unzip -q "$zip" -d "$tmp" || die "Failed to extract $zip"
+
+    # Move any existing install aside so a failed upgrade can be rolled back.
+    if [ -d "$dest" ]; then
+        backup="$ANDROID_HOME/cmdline-tools/latest.backup.$$"
+        rm -rf "$backup"
+        mv "$dest" "$backup" || die "Could not move the existing install aside"
+    fi
+
+    mkdir -p "$dest" || die "Cannot create $dest"
+    if ! mv "$tmp/cmdline-tools/"* "$dest/" 2>/dev/null; then
+        rm -rf "$dest"
+        [ -n "$backup" ] && mv "$backup" "$dest"
+        rm -rf "$tmp"
+        die "Unexpected archive layout in $zip (previous install restored)"
+    fi
+
+    if [ ! -x "$SDKMANAGER" ]; then
+        rm -rf "$dest"
+        [ -n "$backup" ] && mv "$backup" "$dest"
+        rm -rf "$tmp"
+        die "sdkmanager missing after install (previous install restored)"
+    fi
+
+    rm -rf "$tmp" "$zip"
+    [ -n "$backup" ] && rm -rf "$backup"
+    printf '%s\n' "$CMD_TOOLS_BUILD" > "$CMD_TOOLS_MARKER" 2>/dev/null || true
+
+    echo -e "${GREEN}✓ Command Line Tools installed (rev $(installed_cmd_tools_rev || echo unknown), build $CMD_TOOLS_BUILD)${NC}"
+}
+
+function install_skins() {
+    local needed="pixel_6_pro pixel_6 pixel_5"
+    local skin all_present=1
+    for skin in $needed; do
+        [ -d "$ANDROID_HOME/skins/$skin" ] || all_present=0
+    done
+
+    if [ "$all_present" -eq 1 ]; then
+        echo -e "${GREEN}✓ Skins already installed${NC}"
+        return 0
+    fi
+
+    local tmp="$ANDROID_HOME/skins_temp"
+    echo "Fetching modern device frames from github (larskristianhaga)..."
+    rm -rf "$tmp"
+    if ! git clone -q --depth 1 https://github.com/larskristianhaga/Android-emulator-skins.git "$tmp"; then
+        rm -rf "$tmp"
+        warn "Could not download device skins. Continuing without a device frame."
+        return 1
+    fi
+
+    # The destination must exist before cp, and copy only the skin
+    # directories so the repo's README does not land in skins/.
+    mkdir -p "$ANDROID_HOME/skins" || die "Cannot create $ANDROID_HOME/skins"
+    # Copy each skin directory by name. A trailing slash on the source would
+    # make BSD cp flatten the contents into skins/ instead.
+    local d copied=0
+    for d in "$tmp"/*; do
+        [ -d "$d" ] || continue
+        if cp -R "$d" "$ANDROID_HOME/skins/"; then
+            copied=$((copied + 1))
+        else
+            warn "Could not copy $(basename "$d") into $ANDROID_HOME/skins"
+        fi
+    done
+    rm -rf "$tmp"
+    if [ "$copied" -eq 0 ]; then
+        warn "No device skins were installed."
+        return 1
+    fi
+
+    for skin in $needed; do
+        [ -d "$ANDROID_HOME/skins/$skin" ] || { warn "Skin $skin is missing after download"; return 1; }
+    done
+    echo -e "${GREEN}✓ Skins downloaded${NC}"
+}
+
+function preview_skins() {
+    local opener=""
+    if command -v open &> /dev/null; then
+        opener="open"
+    elif command -v xdg-open &> /dev/null; then
+        opener="xdg-open"
+    else
+        warn "No image viewer command (open/xdg-open) available on this system."
+        warn "Browse the frames yourself here: $ANDROID_HOME/skins"
+        return 1
+    fi
+
+    local shown=0 skin img
+    for skin in pixel_6_pro pixel_6 pixel_5; do
+        img="$ANDROID_HOME/skins/$skin/back.webp"
+        if [ -f "$img" ]; then
+            "$opener" "$img" 2>/dev/null && shown=$((shown + 1))
+        fi
+    done
+
+    if [ "$shown" -gt 0 ]; then
+        echo -e "${GREEN}✓ Opened $shown preview image(s)${NC}"
+    else
+        warn "No preview images found under $ANDROID_HOME/skins"
+        return 1
+    fi
+}
+
+function create_shortcut() {
+    local custom_name=$1 avd_name=$2
+
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS App Shortcut (Saved in Applications for Spotlight indexing)
+        mkdir -p "$HOME/Applications" || { warn "Cannot create $HOME/Applications"; return 1; }
+        local app_path="$HOME/Applications/$custom_name.app"
+        rm -rf "$app_path"
+        if osacompile -e "do shell script \"$EMULATOR_BIN -avd $avd_name > /dev/null 2>&1 &\"" -o "$app_path" 2>/dev/null; then
+            echo -e "${GREEN}✓ App created at $app_path (Searchable in Spotlight!)${NC}"
+        else
+            warn "Could not create the macOS app shortcut. Use '$SELF start' instead."
+            return 1
+        fi
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        # Linux Desktop Shortcut (Saved in applications folder for App Launcher)
+        mkdir -p "$HOME/.local/share/applications" || { warn "Cannot create applications dir"; return 1; }
+        local desktop_file="$HOME/.local/share/applications/$custom_name.desktop"
+        {
+            echo "[Desktop Entry]"
+            echo "Version=1.0"
+            echo "Type=Application"
+            echo "Name=$custom_name"
+            echo "Exec=$EMULATOR_BIN -avd $avd_name"
+            echo "Terminal=false"
+        } > "$desktop_file" || { warn "Could not write $desktop_file"; return 1; }
+        chmod +x "$desktop_file"
+        echo -e "${GREEN}✓ App Shortcut created at $desktop_file (Searchable in App Launcher!)${NC}"
+    elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
+        # Windows Batch Shortcut (Saved in Start Menu Programs)
+        local start_menu="$APPDATA/Microsoft/Windows/Start Menu/Programs"
+        # Fallback to desktop if APPDATA is not resolved in bash properly
+        if [ ! -d "$start_menu" ]; then
+            start_menu="$USERPROFILE/Desktop"
+        fi
+        # Point at the SDK we actually installed into, not a guessed path.
+        local win_emulator
+        if command -v cygpath &> /dev/null; then
+            win_emulator=$(cygpath -w "$EMULATOR_BIN")
+        else
+            win_emulator="$EMULATOR_BIN"
+        fi
+        {
+            echo "@echo off"
+            echo "start /B \"\" \"$win_emulator\" -avd $avd_name"
+        } > "$start_menu/$custom_name.bat" || { warn "Could not write the Start Menu shortcut"; return 1; }
+        echo -e "${GREEN}✓ App Shortcut created in Start Menu (Searchable in Windows!)${NC}"
+    fi
+}
+
+function do_setup() {
+    print_header
+
+    # Check if emulator already exists
+    EXISTING_AVDS=$(list_avd_names)
+    if [ -n "$EXISTING_AVDS" ]; then
+        echo -e "\n${YELLOW}Notice: You already have the following Emulators installed:${NC}"
+        echo -e "${GREEN}$EXISTING_AVDS${NC}"
+        echo "Since you already have everything set up, you may not need to install again."
+        if noninteractive; then
+            # Unattended callers want the SDK and a named AVD to exist, not an
+            # early exit, so carry on rather than taking the interactive default.
+            SKIP_INSTALL="n"
+            echo "Unattended mode: continuing instead of skipping."
+        else
+            read -p "Do you want to skip installation and exit? (y/n) [y]: " SKIP_INSTALL
+            SKIP_INSTALL=${SKIP_INSTALL:-y}
+        fi
+        if [[ "$SKIP_INSTALL" == "y" || "$SKIP_INSTALL" == "Y" ]]; then
+            echo -e "Installation skipped. You can start your emulator anytime using '$SELF start'"
+            return 0
+        fi
+    fi
+
+    echo -e "\nDetecting system..."
+    echo -e "${GREEN}✓ $OS_NAME detected${NC}"
+
+    # Detect Architecture
+    SYS_IMAGE="system-images;android-34;google_apis;x86_64"
+    if [[ $(uname -m) == 'arm64' || $(uname -m) == 'aarch64' ]]; then
+        echo -e "${GREEN}✓ ARM64 Architecture detected${NC}"
+        SYS_IMAGE="system-images;android-34;google_apis;arm64-v8a"
+    else
+        echo -e "${GREEN}✓ x86_64 Architecture detected${NC}"
+    fi
+
+    echo -e "\nChecking prerequisites..."
+    require_prerequisites
+
+    echo -e "\nInstalling SDK components..."
+    install_cmdline_tools
+
+    echo -e "\nInstalling Platform Tools, Emulator, and API 34 System Image..."
+    sdk_install "platform-tools" "platforms;android-34" "emulator" "$SYS_IMAGE"
+    verify_sdk_packages
+
+    echo -e "\nDownloading Modern Emulator Skins..."
+    SKINS_OK=1
+    install_skins || SKINS_OK=0
+
+    echo -e "\nSelect Emulator Profile (with Frame):"
+    echo "1) Pixel 6 Pro (1440x3120)"
+    echo "2) Pixel 6 (1080x2400)"
+    echo "3) Pixel 5 (1080x2340)"
+    echo "p) Preview Skins in Browser"
+
+    while true; do
+        if [ -n "${ANDROID_ENV_PROFILE:-}" ]; then
+            AVD_CHOICE="$ANDROID_ENV_PROFILE"
+            echo "Using profile $AVD_CHOICE (ANDROID_ENV_PROFILE)"
+        elif noninteractive; then
+            AVD_CHOICE=1
+            echo "Unattended mode: using profile 1 (Pixel 6 Pro)"
+        else
+            read -p "Enter choice (1, 2, 3, or p) [1]: " AVD_CHOICE
+        fi
+        AVD_CHOICE=${AVD_CHOICE:-1}
+        case "$AVD_CHOICE" in
+            p|P)
+                echo "Opening direct image previews on your computer..."
+                preview_skins || true
+                ;;
+            1|2|3)
+                break
+                ;;
+            *)
+                if [ -n "${ANDROID_ENV_PROFILE:-}" ] || noninteractive; then
+                    die "Invalid profile '$AVD_CHOICE'. ANDROID_ENV_PROFILE must be 1, 2 or 3."
+                fi
+                warn "'$AVD_CHOICE' is not a valid choice. Enter 1, 2, 3, or p."
+                ;;
+        esac
+    done
+
+    if [ -n "${ANDROID_ENV_AVD_NAME:-}" ]; then
+        CUSTOM_NAME="$ANDROID_ENV_AVD_NAME"
+        echo "Using name $CUSTOM_NAME (ANDROID_ENV_AVD_NAME)"
+    elif noninteractive; then
+        CUSTOM_NAME="Android_Emulator"
+        echo "Unattended mode: using name $CUSTOM_NAME"
+    else
+        read -p "Enter a name for your Emulator (e.g. MyPixelPhone): " CUSTOM_NAME
+    fi
+    # Sanitize name: avdmanager only accepts [a-zA-Z0-9._-]
+    CUSTOM_NAME="${CUSTOM_NAME// /_}"
+    CUSTOM_NAME=$(printf '%s' "$CUSTOM_NAME" | tr -cd 'a-zA-Z0-9._-')
+    if [ -z "$CUSTOM_NAME" ]; then
+        CUSTOM_NAME="My_Emulator"
+        echo "Using default name: $CUSTOM_NAME"
+    fi
+
+    if [ "$AVD_CHOICE" == "2" ]; then
+        AVD_NAME="${CUSTOM_NAME}_API_34"
+        DEV_NAME="pixel_6"
+        SKIN_NAME="pixel_6"
+    elif [ "$AVD_CHOICE" == "3" ]; then
+        AVD_NAME="${CUSTOM_NAME}_API_34"
+        DEV_NAME="pixel_5"
+        SKIN_NAME="pixel_5"
+    else
+        AVD_NAME="${CUSTOM_NAME}_API_34"
+        DEV_NAME="pixel_6_pro"
+        SKIN_NAME="pixel_6_pro"
+    fi
+
+    echo -e "\nCreating Android Virtual Device ($AVD_NAME)..."
+    if avd_exists "$AVD_NAME"; then
+         echo -e "${GREEN}✓ AVD $AVD_NAME already exists${NC}"
+    else
+         "$AVDMANAGER" create avd -n "$AVD_NAME" -k "$SYS_IMAGE" --device "$DEV_NAME" --force <<< "no" \
+             || die "avdmanager could not create the AVD. Run '$SELF doctor' for details."
+
+         AVD_CONFIG="$AVD_HOME/$AVD_NAME.avd/config.ini"
+         if [ ! -f "$AVD_CONFIG" ]; then
+             die "AVD created but config.ini not found at $AVD_CONFIG"
+         fi
+
+         # Apply Skin configuration. Absolute path, and replace the keys
+         # avdmanager already wrote rather than appending duplicates.
+         if [ "$SKINS_OK" -eq 1 ] && [ -d "$ANDROID_HOME/skins/$SKIN_NAME" ]; then
+             set_ini_key "$AVD_CONFIG" "skin.name" "$SKIN_NAME" \
+                 && set_ini_key "$AVD_CONFIG" "skin.path" "$ANDROID_HOME/skins/$SKIN_NAME" \
+                 && echo -e "${GREEN}✓ AVD Created with $SKIN_NAME frame!${NC}" \
+                 || warn "AVD created, but the skin could not be applied."
+         else
+             echo -e "${GREEN}✓ AVD Created${NC}"
+             warn "No device frame applied (skins unavailable)."
+         fi
+    fi
+
+    echo -e "\nCreating App Shortcut ($CUSTOM_NAME)..."
+    create_shortcut "$CUSTOM_NAME" "$AVD_NAME" || true
+
+    echo -e "\n${YELLOW}Setup Complete! 🚀${NC}"
+    echo "To use these tools globally, add the following to your ~/.zshrc or ~/.bash_profile:"
+    echo "export ANDROID_HOME=$ANDROID_HOME"
+    echo "export PATH=\$ANDROID_HOME/emulator:\$ANDROID_HOME/platform-tools:\$ANDROID_HOME/cmdline-tools/latest/bin:\$PATH"
+}
+
+function do_tools() {
+    echo -e "\n${YELLOW}Android Command-Line Tools${NC}\n"
+
+    local rev build
+    rev=$(installed_cmd_tools_rev || true)
+    if [ -n "$rev" ]; then
+        echo "Installed:   rev $rev"
+        build=""
+        [ -f "$CMD_TOOLS_MARKER" ] && build=$(cat "$CMD_TOOLS_MARKER" 2>/dev/null)
+        [ -n "$build" ] && echo "             build $build"
+        echo "             $ANDROID_HOME/cmdline-tools/latest"
+    else
+        echo "Installed:   none"
+    fi
+
+    echo "Host token:  $CMD_TOOLS_HOST"
+    echo -n "Resolving:   "
+    resolve_cmd_tools
+    echo "build $CMD_TOOLS_BUILD"
+    echo "Source:      $CMD_TOOLS_SOURCE"
+    echo "URL:         $CMD_TOOLS_URL"
+
+    if [ -n "$build" ] && [ -n "$CMD_TOOLS_BUILD" ]; then
+        if [ "$build" -lt "$CMD_TOOLS_BUILD" ] 2>/dev/null; then
+            echo -e "\n${YELLOW}An upgrade is available.${NC}"
+        else
+            echo -e "\n${GREEN}✓ Up to date.${NC}"
+        fi
+    fi
+
+    echo -e "\n${YELLOW}Overrides${NC} (environment variables):"
+    echo "  ANDROID_CMDLINE_TOOLS_BUILD=<build>   install a specific build"
+    echo "  ANDROID_CMDLINE_TOOLS_URL=<url>       install an exact archive"
+    echo "  ANDROID_CMDLINE_TOOLS_PIN=1           use the built-in pin ($CMD_TOOLS_BUILD_PIN), no network"
+    echo "  ANDROID_CMDLINE_TOOLS_UPGRADE=1       reinstall/upgrade during setup"
+    echo "  ANDROID_ENV_USE_SDKMANAGER=1          use legacy sdkmanager, not the android CLI"
+    echo ""
+    echo "Example: ANDROID_CMDLINE_TOOLS_UPGRADE=1 $SELF setup"
+    echo ""
+}
+
+# Path of the desktop shortcut create_shortcut() would have made for an AVD.
+# setup names the AVD "<name>_API_<level>" and the shortcut "<name>", so the
+# suffix is stripped back off here.
+function shortcut_path_for() {
+    local avd_name=$1
+    local short_name="${avd_name%_API_[0-9]*}"
+    # Parameter expansion cannot do a numeric class, so verify and fall back.
+    case "$avd_name" in
+        *_API_[0-9]*) short_name=$(printf '%s' "$avd_name" | sed -E 's/_API_[0-9]+$//') ;;
+        *)            short_name="$avd_name" ;;
+    esac
+
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        printf '%s' "$HOME/Applications/$short_name.app"
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        printf '%s' "$HOME/.local/share/applications/$short_name.desktop"
+    elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
+        local start_menu="$APPDATA/Microsoft/Windows/Start Menu/Programs"
+        [ -d "$start_menu" ] || start_menu="$USERPROFILE/Desktop"
+        printf '%s' "$start_menu/$short_name.bat"
+    fi
+}
+
+function do_delete() {
+    local avd_name="" assume_yes=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            -y|--yes) assume_yes=1 ;;
+            -*)       die "Unknown option: $arg" ;;
+            *)        [ -z "$avd_name" ] && avd_name="$arg" ;;
+        esac
+    done
+
+    local avds
+    avds=$(list_avd_names)
+    [ -n "$avds" ] || die "No AVDs found in $AVD_HOME. Nothing to delete."
+
+    if [ -z "$avd_name" ]; then
+        echo -e "${YELLOW}Available Android Virtual Devices:${NC}"
+        echo "$avds"
+        echo ""
+        if noninteractive; then
+            die "No emulator named. Pass one, e.g. $SELF delete <name> -y"
+        fi
+        read -p "Which emulator should be deleted? (blank to cancel): " avd_name
+        if [ -z "$avd_name" ]; then
+            echo "Cancelled. Nothing was deleted."
+            return 0
+        fi
+    fi
+
+    avd_exists "$avd_name" \
+        || die "AVD '$avd_name' not found. Run '$SELF list' to see what exists."
+
+    # Refuse to delete an AVD that is currently booted. Anchored so that a
+    # running "Foo_API_34_v2" does not block deletion of "Foo_API_34".
+    if pgrep -f -- "-avd $avd_name([[:space:]]|\$)" > /dev/null 2>&1; then
+        die "'$avd_name' is currently running. Stop the emulator first, then retry."
+    fi
+
+    local avd_dir="$AVD_HOME/$avd_name.avd"
+    local shortcut
+    shortcut=$(shortcut_path_for "$avd_name")
+
+    echo -e "\n${YELLOW}This will permanently delete:${NC}"
+    local size="unknown size"
+    [ -d "$avd_dir" ] && size=$(du -sh "$avd_dir" 2>/dev/null | cut -f1)
+    echo "  AVD       $avd_name  ($size)"
+    echo "            $avd_dir"
+    echo "            $AVD_HOME/$avd_name.ini"
+    if [ -n "$shortcut" ] && [ -e "$shortcut" ]; then
+        echo "  Shortcut  $shortcut"
+    else
+        echo "  Shortcut  (none found)"
+    fi
+    echo ""
+    echo "The SDK, system images and your other emulators are not touched."
+    echo ""
+
+    if [ "$assume_yes" -ne 1 ] && noninteractive; then
+        die "Refusing to delete '$avd_name' unattended without -y."
+    fi
+    if [ "$assume_yes" -ne 1 ]; then
+        read -p "Type the emulator name to confirm: " confirm
+        if [ "$confirm" != "$avd_name" ]; then
+            echo "Names did not match. Nothing was deleted."
+            return 0
+        fi
+    fi
+
+    if [ -x "$AVDMANAGER" ]; then
+        "$AVDMANAGER" delete avd -n "$avd_name" > /dev/null 2>&1 \
+            || warn "avdmanager could not delete the AVD; removing its files directly."
+    else
+        warn "avdmanager not available; removing AVD files directly."
+    fi
+
+    # avdmanager leaves nothing behind on success, but make sure either way.
+    rm -rf "$avd_dir" "$AVD_HOME/$avd_name.ini"
+
+    if avd_exists "$avd_name" || [ -d "$avd_dir" ]; then
+        die "Failed to remove $avd_name. Check permissions on $AVD_HOME."
+    fi
+    echo -e "${GREEN}✓ Deleted AVD $avd_name${NC}"
+
+    if [ -n "$shortcut" ] && [ -e "$shortcut" ]; then
+        if rm -rf "$shortcut"; then
+            echo -e "${GREEN}✓ Removed shortcut $shortcut${NC}"
+        else
+            warn "Could not remove $shortcut"
+        fi
+    fi
+}
+
+# True if $1 is a directory on PATH.
+function dir_on_path() {
+    case ":$PATH:" in
+        *":$1:"*) return 0 ;;
+        *)        return 1 ;;
+    esac
+}
+
+# Absolute path of this script, following a symlink if we were invoked
+# through one.
+function self_path() {
+    local src="$0"
+    case "$src" in
+        */*) ;;
+        *)   src=$(command -v "$src" 2>/dev/null) || return 1 ;;
+    esac
+    # Resolve symlinks so `install` always records the real file.
+    while [ -L "$src" ]; do
+        local link
+        link=$(readlink "$src")
+        case "$link" in
+            /*) src="$link" ;;
+            *)  src="$(dirname "$src")/$link" ;;
+        esac
+    done
+    printf '%s/%s' "$(cd "$(dirname "$src")" && pwd)" "$(basename "$src")"
+}
+
+function do_install() {
+    local target_dir=$1
+    local src
+    src=$(self_path) || die "Could not work out where this script lives."
+    [ -f "$src" ] || die "Could not find this script at $src"
+
+    # Prefer a directory that is already on PATH and writable without sudo.
+    if [ -z "$target_dir" ]; then
+        local d
+        for d in "$HOME/.local/bin" "$HOME/bin" /usr/local/bin; do
+            if [ -d "$d" ] && [ -w "$d" ] && dir_on_path "$d"; then
+                target_dir="$d"
+                break
+            fi
+        done
+        [ -n "$target_dir" ] || target_dir="$HOME/.local/bin"
+    fi
+
+    mkdir -p "$target_dir" || die "Cannot create $target_dir"
+    [ -w "$target_dir" ] || die "$target_dir is not writable. Pass a different directory, e.g.
+  $SELF install \"\$HOME/.local/bin\""
+
+    local name dest
+    name=$(basename "$src")
+    dest="$target_dir/$name"
+
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        local existing=""
+        [ -L "$dest" ] && existing=$(self_path_of_link "$dest")
+        if [ "$existing" = "$src" ]; then
+            echo -e "${GREEN}✓ Already installed at $dest${NC}"
+            install_path_hint "$target_dir" "$name"
+            return 0
+        fi
+        if [ -L "$dest" ] && [ ! -e "$dest" ]; then
+            # Dangling symlink: the previous source directory was moved or
+            # deleted. Nothing is lost by replacing it, so do not ask.
+            warn "Replacing a broken symlink at $dest"
+            warn "  it pointed at ${existing:-an unknown path}"
+            rm -f "$dest"
+        elif noninteractive; then
+            die "$dest already exists and does not point at this script.
+Remove it first, or re-run interactively to be asked."
+        else
+            warn "$dest already exists and does not point at this script."
+            read -p "Replace it? (y/n) [n]: " replace
+            case "${replace:-n}" in
+                y|Y) ;;
+                *) echo "Left $dest alone. Nothing was installed."; return 0 ;;
+            esac
+        fi
+    fi
+
+    # A symlink means edits to the script take effect immediately. Copy is the
+    # fallback for systems where symlinks are restricted (e.g. plain Windows).
+    if ln -sfn "$src" "$dest" 2>/dev/null; then
+        echo -e "${GREEN}✓ Linked $dest -> $src${NC}"
+    elif cp "$src" "$dest" 2>/dev/null; then
+        chmod +x "$dest"
+        warn "Symlinks unavailable, so a copy was installed instead."
+        warn "Re-run '$SELF install' after changing the script to refresh it."
+        echo -e "${GREEN}✓ Copied to $dest${NC}"
+    else
+        die "Could not install to $dest"
+    fi
+
+    chmod +x "$src" 2>/dev/null || true
+    install_path_hint "$target_dir" "$name"
+}
+
+# Resolve what a symlink ultimately points at.
+function self_path_of_link() {
+    local src=$1 link
+    while [ -L "$src" ]; do
+        link=$(readlink "$src")
+        case "$link" in
+            /*) src="$link" ;;
+            *)  src="$(dirname "$src")/$link" ;;
+        esac
+    done
+    printf '%s' "$src"
+}
+
+function install_path_hint() {
+    local target_dir=$1 name=$2
+
+    if ! dir_on_path "$target_dir"; then
+        echo ""
+        warn "$target_dir is not on your PATH yet. Add this line to your shell profile:"
+        echo "  export PATH=\"$target_dir:\$PATH\""
+        echo ""
+        echo "Then open a new terminal and run: $name setup"
+        return 0
+    fi
+
+    local resolved
+    resolved=$(command -v "$name" 2>/dev/null)
+    if [ -n "$resolved" ]; then
+        echo "You can now run '$name' from any directory."
+        if [ "$resolved" != "$target_dir/$name" ]; then
+            warn "Note: '$name' currently resolves to $resolved, which is earlier on your PATH."
+        fi
+    else
+        warn "Installed, but '$name' is not resolving yet. Open a new terminal and retry."
+    fi
+}
+
+function do_uninstall() {
+    local name="android-env" removed=0 d dest src
+    src=$(self_path 2>/dev/null || true)
+
+    for d in $(printf '%s' "$PATH" | tr ':' ' '); do
+        dest="$d/$name"
+        [ -e "$dest" ] || [ -L "$dest" ] || continue
+        # Never remove the script from its own source directory.
+        if [ -n "$src" ] && [ "$dest" = "$src" ]; then
+            continue
+        fi
+        echo "Found $dest"
+        if rm -f "$dest" 2>/dev/null; then
+            echo -e "${GREEN}✓ Removed $dest${NC}"
+            removed=$((removed + 1))
+        else
+            warn "Could not remove $dest (try a directory you own, or use sudo)"
+        fi
+    done
+
+    if [ "$removed" -eq 0 ]; then
+        echo "Nothing to uninstall: no '$name' found on your PATH outside its source directory."
+    else
+        echo ""
+        echo "Your SDK, emulators and shortcuts were not touched."
+        # $SELF would name the bare command, which no longer resolves.
+        echo "Delete emulators with '${src:-./android-env} delete' if you want those gone too."
+    fi
+}
+
+function do_list() {
+    echo -e "${YELLOW}Available Android Virtual Devices:${NC}"
+    local avds
+    avds=$(list_avd_names)
+    if [ -n "$avds" ]; then
+        echo "$avds"
+    else
+        echo -e "${RED}No AVDs found in $AVD_HOME. Run '$SELF setup' first.${NC}"
+    fi
+}
+
+# Serial of the running emulator that hosts this AVD, if any.
+function emulator_serial_for() {
+    local avd_name=$1 serial
+    [ -x "$ADB_BIN" ] || return 1
+    for serial in $("$ADB_BIN" devices 2>/dev/null | awk '/^emulator-/{print $1}'); do
+        local got
+        got=$("$ADB_BIN" -s "$serial" emu avd name 2>/dev/null | head -n 1 | tr -d '\r')
+        if [ "$got" = "$avd_name" ]; then
+            printf '%s' "$serial"
+            return 0
+        fi
+    done
+    return 1
+}
+
+function avd_is_running() {
+    pgrep -f -- "-avd $1([[:space:]]|\$)" > /dev/null 2>&1
+}
+
+# Block until the emulator reports a completed boot. Prints the serial on
+# stdout and sets WAIT_FOR_BOOT_WAITED to the seconds actually spent.
+#
+# Callers use this inside $(...), where die() would only kill the subshell and
+# its message would be lost, so failures are signalled by exit code instead:
+#   0 = booted    2 = adb missing
+#   3 = emulator process exited during boot
+#   4 = timed out
+function wait_for_boot() {
+    local avd_name=$1 timeout=${2:-$ANDROID_ENV_BOOT_TIMEOUT}
+    local waited=0 serial=""
+
+    [ -x "$ADB_BIN" ] || return 2
+
+    while [ "$waited" -lt "$timeout" ]; do
+        if ! avd_is_running "$avd_name" && [ "$waited" -gt 10 ]; then
+            printf '%s' "$waited" > "$WAIT_WAITED_FILE" 2>/dev/null || true
+            return 3
+        fi
+        serial=$(emulator_serial_for "$avd_name" 2>/dev/null || true)
+        if [ -n "$serial" ]; then
+            local booted
+            booted=$("$ADB_BIN" -s "$serial" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n')
+            if [ "$booted" = "1" ]; then
+                printf '%s' "$serial"
+                return 0
+            fi
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    printf '%s' "$waited" > "$WAIT_WAITED_FILE" 2>/dev/null || true
+    return 4
+}
+
+# Turn a wait_for_boot exit code into an explanation.
+function boot_failure_reason() {
+    local code=$1 avd_name=$2 timeout=$3 waited=""
+    [ -f "$WAIT_WAITED_FILE" ] && waited=$(cat "$WAIT_WAITED_FILE" 2>/dev/null)
+    case "$code" in
+        2) printf "adb not found at %s. Run '%s setup' first." "$ADB_BIN" "$SELF" ;;
+        3) printf "The emulator process for '%s' exited after %ss without finishing boot. Check that virtualization is available and the system image is intact." "$avd_name" "${waited:-?}" ;;
+        4) printf "'%s' did not finish booting within %ss." "$avd_name" "$timeout" ;;
+        *) printf "'%s' failed to boot (code %s)." "$avd_name" "$code" ;;
+    esac
+}
+
+function do_start() {
+    local avd_name="" wait_for=0 timeout="$ANDROID_ENV_BOOT_TIMEOUT" arg
+    for arg in "$@"; do
+        case "$arg" in
+            -w|--wait)   wait_for=1 ;;
+            --timeout=*) timeout="${arg#--timeout=}" ;;
+            -*)          die "Unknown option: $arg" ;;
+            *)           [ -z "$avd_name" ] && avd_name="$arg" ;;
+        esac
+    done
+
+    if [ -z "$avd_name" ]; then
+        avd_name=$(list_avd_names)
+        avd_name=${avd_name%%$'\n'*}
+        if [ -z "$avd_name" ]; then
+            die "No AVDs found. Run '$SELF setup' first."
+        fi
+        echo "No AVD specified, using default: $avd_name"
+    elif ! avd_exists "$avd_name"; then
+        die "AVD '$avd_name' not found. Run '$SELF list' to see what exists."
+    fi
+
+    [ -x "$EMULATOR_BIN" ] || die "Emulator not installed at $EMULATOR_BIN. Run '$SELF setup' first."
+
+    # Already up? Do not start a second copy of the same AVD.
+    if avd_is_running "$avd_name"; then
+        echo -e "${GREEN}✓ $avd_name is already running${NC}"
+    else
+        echo -e "Starting emulator: ${YELLOW}$avd_name${NC}..."
+        nohup "$EMULATOR_BIN" -avd "$avd_name" > /dev/null 2>&1 &
+        echo -e "${GREEN}✓ Emulator booting in background${NC}"
+    fi
+
+    if [ "$wait_for" -eq 1 ]; then
+        echo "Waiting up to ${timeout}s for boot to complete..."
+        local serial code
+        serial=$(wait_for_boot "$avd_name" "$timeout"); code=$?
+        if [ "$code" -eq 0 ]; then
+            echo -e "${GREEN}✓ $avd_name booted ($serial)${NC}"
+        else
+            die "$(boot_failure_reason "$code" "$avd_name" "$timeout")"
+        fi
+    fi
+}
+
+function do_stop() {
+    local avd_name=$1
+
+    if [ -z "$avd_name" ]; then
+        # Stop every running emulator.
+        local any=0 serial
+        if [ -x "$ADB_BIN" ]; then
+            for serial in $("$ADB_BIN" devices 2>/dev/null | awk '/^emulator-/{print $1}'); do
+                "$ADB_BIN" -s "$serial" emu kill > /dev/null 2>&1 && any=1
+                echo -e "${GREEN}✓ Stopped $serial${NC}"
+            done
+        fi
+        [ "$any" -eq 1 ] || echo "No running emulators."
+        return 0
+    fi
+
+    if ! avd_is_running "$avd_name"; then
+        echo "'$avd_name' is not running."
+        return 0
+    fi
+
+    local serial
+    serial=$(emulator_serial_for "$avd_name" 2>/dev/null || true)
+    if [ -n "$serial" ] && [ -x "$ADB_BIN" ]; then
+        "$ADB_BIN" -s "$serial" emu kill > /dev/null 2>&1 || true
+    fi
+
+    # Fall back to signalling the process if the console command did not take.
+    local waited=0
+    while avd_is_running "$avd_name" && [ "$waited" -lt 20 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if avd_is_running "$avd_name"; then
+        pkill -f -- "-avd $avd_name([[:space:]]|\$)" 2>/dev/null || true
+        while avd_is_running "$avd_name" && [ "$waited" -lt 40 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+    fi
+
+    if avd_is_running "$avd_name"; then
+        die "Could not stop '$avd_name'."
+    fi
+    echo -e "${GREEN}✓ Stopped $avd_name${NC}"
+}
+
+# One call that guarantees a booted, ready emulator. Intended for scripts and
+# MCP servers: provisions the SDK and creates the AVD if either is missing,
+# starts it if it is not running, then waits for boot and prints the serial.
+function do_ensure() {
+    local avd_name="" timeout="$ANDROID_ENV_BOOT_TIMEOUT" as_json=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --json)      as_json=1 ;;
+            --timeout=*) timeout="${arg#--timeout=}" ;;
+            -*)          die "Unknown option: $arg" ;;
+            *)           [ -z "$avd_name" ] && avd_name="$arg" ;;
+        esac
+    done
+
+    # Everything below must run unattended.
+    export ANDROID_ENV_YES=1
+
+    local log="${TMPDIR:-/tmp}/android-env-ensure.$$.log"
+    local created=0 provisioned=0
+
+    # 1. SDK and at least one AVD.
+    local have_avd=0
+    if [ -n "$avd_name" ]; then
+        avd_exists "$avd_name" && have_avd=1
+    else
+        avd_name=$(list_avd_names)
+        avd_name=${avd_name%%$'\n'*}
+        [ -n "$avd_name" ] && have_avd=1
+    fi
+
+    if [ "$have_avd" -eq 0 ] || [ ! -x "$EMULATOR_BIN" ]; then
+        [ -n "$avd_name" ] && export ANDROID_ENV_AVD_NAME="${avd_name%_API_34}"
+        if [ "$as_json" -eq 1 ]; then
+            do_setup > "$log" 2>&1 || {
+                json_fail "setup failed; see $log" "$avd_name"
+                return 1
+            }
+        else
+            do_setup || die "setup failed"
+        fi
+        provisioned=1
+        created=1
+        # setup names the AVD <name>_API_34.
+        if [ -z "$avd_name" ] || ! avd_exists "$avd_name"; then
+            avd_name=$(list_avd_names)
+            avd_name=${avd_name%%$'\n'*}
+        fi
+    fi
+
+    [ -n "$avd_name" ] || { json_or_die "$as_json" "No emulator available after setup." ""; return 1; }
+
+    # 2. Running.
+    local was_running=0
+    if avd_is_running "$avd_name"; then
+        was_running=1
+    else
+        [ -x "$EMULATOR_BIN" ] || { json_or_die "$as_json" "Emulator binary missing at $EMULATOR_BIN" "$avd_name"; return 1; }
+        nohup "$EMULATOR_BIN" -avd "$avd_name" > /dev/null 2>&1 &
+    fi
+
+    # 3. Booted.
+    local serial code
+    serial=$(wait_for_boot "$avd_name" "$timeout"); code=$?
+    if [ "$code" -ne 0 ]; then
+        json_or_die "$as_json" "$(boot_failure_reason "$code" "$avd_name" "$timeout")" "$avd_name"
+        rm -f "$WAIT_WAITED_FILE"
+        return 1
+    fi
+    rm -f "$WAIT_WAITED_FILE"
+
+    local api abi
+    api=$("$ADB_BIN" -s "$serial" shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r\n')
+    abi=$("$ADB_BIN" -s "$serial" shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r\n')
+
+    if [ "$as_json" -eq 1 ]; then
+        printf '{"success":true,"avd":"%s","serial":"%s","api_level":"%s","abi":"%s","already_running":%s,"provisioned":%s}\n' \
+            "$avd_name" "$serial" "$api" "$abi" \
+            "$([ "$was_running" -eq 1 ] && echo true || echo false)" \
+            "$([ "$provisioned" -eq 1 ] && echo true || echo false)"
+    else
+        echo -e "${GREEN}✓ $avd_name ready${NC}"
+        echo "  serial:    $serial"
+        echo "  api level: $api"
+        echo "  abi:       $abi"
+        [ "$created" -eq 1 ] && echo "  (created by this run)"
+        [ "$was_running" -eq 1 ] && echo "  (was already running)"
+    fi
+}
+
+function json_fail() {
+    printf '{"success":false,"error":%s,"avd":"%s"}\n' "$(json_string "$1")" "$2"
+}
+
+# Minimal JSON string escaping for error messages.
+function json_string() {
+    printf '%s' "$1" | awk '{
+        gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, " ");
+        printf "%s%s", (NR>1 ? " " : ""), $0
+    } END { }' | sed 's/^/"/; s/$/"/'
+}
+
+function json_or_die() {
+    if [ "$1" = "1" ]; then
+        json_fail "$2" "$3"
+    else
+        die "$2"
+    fi
+}
+
+
+# Main Command Router
+case "$1" in
+    setup)
+        do_setup
+        ;;
+    doctor)
+        do_doctor
+        ;;
+    list)
+        do_list
+        ;;
+    tools)
+        do_tools
+        ;;
+    install)
+        do_install "$2"
+        ;;
+    uninstall)
+        do_uninstall
+        ;;
+    start)
+        shift
+        do_start "$@"
+        ;;
+    stop)
+        do_stop "$2"
+        ;;
+    ensure)
+        shift
+        do_ensure "$@"
+        ;;
+    delete)
+        shift
+        do_delete "$@"
+        ;;
+    version)
+        echo "$SELF_NAME version $VERSION"
+        ;;
+    *)
+        show_help
+        ;;
+esac

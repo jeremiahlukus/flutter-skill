@@ -111,7 +111,8 @@ Future<void> runDoctor(List<String> args) async {
       ok('Android SDK found');
     }
   } else {
-    warn('Android SDK not found', 'Set ANDROID_HOME environment variable');
+    warn('Android SDK not found',
+        'Set ANDROID_HOME, or let the android_emulator_ensure tool install it');
   }
 
   // ADB

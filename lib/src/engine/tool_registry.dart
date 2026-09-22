@@ -43,6 +43,12 @@ class ToolRegistry {
     'diagnose_project',
     'native_list_simulators',
     'idb_describe',
+    // Emulator lifecycle runs before there is anything to connect to.
+    'android_emulator_ensure',
+    'android_emulator_start',
+    'android_emulator_stop',
+    'android_emulator_list',
+    'android_emulator_delete',
   };
 
   /// CDP-only tools that don't apply to bridge/Flutter platforms.
@@ -2432,6 +2438,145 @@ This captures the ENTIRE device screen, not just the Flutter app content.""",
               "description": "JPEG quality 1-100 (default: 80)",
             },
           },
+        },
+      },
+      // ==================== Android Emulator Lifecycle ====================
+      {
+        "name": "android_emulator_ensure",
+        "description": """Guarantee a booted, ready Android emulator. Provisions the Android SDK first if needed.
+
+[USE WHEN]
+- You need an Android device to test on and none is running
+- Starting an automated test run on a machine that may have no Android SDK
+- Before launch_app / connect_app when targeting Android
+
+[BEHAVIOUR]
+Idempotent, so it is safe to call at the start of every run:
+- No Android SDK -> installs command-line tools, platform tools, a system image and the emulator
+- No emulator defined -> creates one (Pixel 6 Pro, API 34) with a device frame
+- Emulator not running -> boots it
+- Waits until the device reports a completed boot, then returns its serial
+- Already booted -> returns in about a second with already_running: true
+
+[TIMING]
+A first run downloads well over a GB and can take several minutes. Raise
+timeout_seconds on a cold machine. A warm start is roughly 15-40 seconds.
+
+[RETURNS]
+avd, serial (e.g. emulator-5554), api_level, abi, already_running, provisioned
+
+[NEXT]
+Pass the returned serial to launch_app, or use the adb-backed tools directly.""",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "avd_name": {
+              "type": "string",
+              "description":
+                  "Specific emulator to ensure. Defaults to the first one available, creating one if there are none."
+            },
+            "timeout_seconds": {
+              "type": "number",
+              "description":
+                  "Total budget including a possible SDK install (default: 900)."
+            },
+          },
+        },
+      },
+      {
+        "name": "android_emulator_start",
+        "description": """Boot an existing Android emulator and optionally wait until it is ready.
+
+[USE WHEN]
+- An emulator already exists and you just need it running
+- You want a specific emulator rather than the first available
+
+[NOTES]
+- Does not provision anything. Use android_emulator_ensure if the SDK or
+  emulator might be missing.
+- Will not start a second copy of an emulator that is already running.
+- With wait: true (the default) it returns only once the device reports a
+  completed boot, so the device is usable immediately afterwards.""",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "avd_name": {
+              "type": "string",
+              "description":
+                  "Emulator to start. Defaults to the first one available."
+            },
+            "wait": {
+              "type": "boolean",
+              "description":
+                  "Block until boot completes (default: true). False returns as soon as the process is launched."
+            },
+            "timeout_seconds": {
+              "type": "number",
+              "description": "How long to wait for boot (default: 300)."
+            },
+          },
+        },
+      },
+      {
+        "name": "android_emulator_stop",
+        "description": """Shut down a running Android emulator.
+
+[USE WHEN]
+- Cleaning up after an automated test run
+- Freeing memory, or resetting to a clean boot
+
+[NOTES]
+Omit avd_name to stop every running emulator. Shuts down through the emulator
+console and only signals the process if that does not take.""",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "avd_name": {
+              "type": "string",
+              "description":
+                  "Emulator to stop. Omit to stop all running emulators."
+            },
+          },
+        },
+      },
+      {
+        "name": "android_emulator_list",
+        "description": """List the Android emulators defined on this machine.
+
+[USE WHEN]
+- Choosing which emulator to start
+- Checking whether any emulator exists before a test run
+
+[DIFFERS FROM native_list_simulators]
+This lists emulators that are *defined*, running or not.
+native_list_simulators reports devices currently visible to adb/simctl.""",
+        "inputSchema": {"type": "object", "properties": {}},
+      },
+      {
+        "name": "android_emulator_delete",
+        "description": """Delete an Android emulator and its desktop launcher.
+
+[USE WHEN]
+- Tearing down an emulator created for a test run
+- Reclaiming disk space, since each emulator can be several GB
+
+[SAFETY]
+Destructive, and requires confirm: true. Refused while that emulator is
+running. Never touches the SDK, system images or your other emulators.""",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "avd_name": {
+              "type": "string",
+              "description": "Emulator to delete (required)."
+            },
+            "confirm": {
+              "type": "boolean",
+              "description":
+                  "Must be true to proceed. Guards against accidental deletion."
+            },
+          },
+          "required": ["avd_name", "confirm"],
         },
       },
       {

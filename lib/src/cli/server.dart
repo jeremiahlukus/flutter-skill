@@ -31,6 +31,7 @@ part 'tool_handlers/flutter_helpers.dart';
 part 'tool_handlers/plugin_handlers.dart';
 part 'tool_handlers/discovery_helpers.dart';
 part 'tool_handlers/bridge_flutter_handlers.dart';
+part 'tool_handlers/android_emulator_handlers.dart';
 part 'tool_handlers/bf_inspection.dart';
 part 'tool_handlers/bf_interaction.dart';
 part 'tool_handlers/bf_screenshot.dart';
@@ -689,6 +690,7 @@ class FlutterMcpServer {
       _handleCdpConnectionTools,
       _handleDevTools,
       _handleNativeTools,
+      _handleAndroidEmulatorTools,
       _handleAuthTools,
       _handleRecordingTools,
       _handleI18nTools,
