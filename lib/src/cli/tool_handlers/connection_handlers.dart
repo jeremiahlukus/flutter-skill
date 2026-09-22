@@ -1,6 +1,30 @@
 part of '../server.dart';
 
 extension _ConnectionHandlers on FlutterMcpServer {
+  /// Convert a Dart VM Service HTTP URI into the WebSocket URI the client
+  /// needs.
+  ///
+  /// `flutter run` advertises the service as
+  /// `http://127.0.0.1:PORT/TOKEN=/`, but vmServiceConnectUri speaks
+  /// WebSocket and rejects an http scheme outright. The conversion is a
+  /// scheme swap plus a trailing `ws` path segment:
+  ///   http://127.0.0.1:50000/TOKEN=/  ->  ws://127.0.0.1:50000/TOKEN=/ws
+  static String vmServiceHttpToWs(String uri) {
+    final parsed = Uri.tryParse(uri);
+    if (parsed == null) return uri;
+    if (parsed.scheme == 'ws' || parsed.scheme == 'wss') return uri;
+
+    final scheme = parsed.scheme == 'https' ? 'wss' : 'ws';
+    final segments =
+        parsed.pathSegments.where((seg) => seg.isNotEmpty).toList();
+    if (segments.isEmpty || segments.last != 'ws') segments.add('ws');
+    return parsed.replace(scheme: scheme, pathSegments: segments).toString();
+  }
+
+  /// Port from a VM Service URI. The previous inline split took the text
+  /// after the last ':', which is the whole `PORT/TOKEN=/` tail.
+  static int parsedVmPort(String uri) => Uri.tryParse(uri)?.port ?? 0;
+
   /// Connection, session, and HTTP tools
   /// Returns null if the tool is not handled.
   Future<dynamic> _handleConnectionTools(
@@ -313,6 +337,8 @@ extension _ConnectionHandlers on FlutterMcpServer {
           final match = vmRegex.firstMatch(line);
           if (match != null && !completer.isCompleted) {
             final uri = match.group(0)!;
+            // Flutter prints an http:// URI; the client needs ws://.
+            final wsUri = _ConnectionHandlers.vmServiceHttpToWs(uri);
 
             // Disconnect old client for this session if exists
             if (_clients.containsKey(sessionId)) {
@@ -320,7 +346,7 @@ extension _ConnectionHandlers on FlutterMcpServer {
             }
 
             // Create new client and session
-            final client = FlutterSkillClient(uri);
+            final client = FlutterSkillClient(wsUri);
             client.connect().then((_) {
               // Store client and session info
               _clients[sessionId] = client;
@@ -330,14 +356,14 @@ extension _ConnectionHandlers on FlutterMcpServer {
                     args['name'] as String? ?? 'App on ${deviceId ?? 'device'}',
                 projectPath: projectPath,
                 deviceId: deviceId?.toString() ?? 'unknown',
-                port: int.tryParse(uri.split(':').last.split('/').first) ?? 0,
-                vmServiceUri: uri,
+                port: _ConnectionHandlers.parsedVmPort(uri),
+                vmServiceUri: wsUri,
               );
 
               // Always switch to the newly launched session
               _activeSessionId = sessionId;
 
-              completer.complete("Launched and connected to $uri");
+              completer.complete("Launched and connected to $wsUri");
             }).catchError((e) {
               completer.completeError(
                   "Found VM Service URI but failed to connect: $e");
