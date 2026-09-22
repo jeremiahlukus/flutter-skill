@@ -34,6 +34,29 @@
 
 ---
 
+## 🍴 About This Fork
+
+This is a fork of [ai-dashboad/flutter-skill](https://github.com/ai-dashboad/flutter-skill) that adds
+**Android emulator lifecycle management**, so an agent can bring up a device by
+itself instead of requiring one to already be running.
+
+Upstream can drive an Android emulator but assumes one exists and is booted —
+`native_list_simulators` was the only emulator-related tool, and `doctor` could
+do no more than tell you to set `ANDROID_HOME`. An agent asked to test an
+Android feature on a fresh machine had nowhere to start.
+
+**Added:** five [Android emulator tools](#android-emulator-lifecycle), all
+available *before* a connection exists, since bringing up an emulator
+necessarily precedes having an app to connect to.
+
+**Also fixed:** `launch_app` never worked for Flutter apps. It scraped the
+`http://` VM Service URI from `flutter run` output and passed it straight to a
+WebSocket connect, failing every launch with
+`WebSocketException: Unsupported URL scheme 'http'`. See
+[the fix](#android-emulator-lifecycle).
+
+---
+
 ## 30-Second Demo
 
 https://github.com/user-attachments/assets/d4617c73-043f-424c-9a9a-1a61d4c2d3c6
@@ -381,17 +404,20 @@ Then batch multiple actions in one call:
 - `hot_reload` / `hot_restart`
 - `get_logs` / `get_errors`
 - `scan_and_connect` — auto-find apps
+- `android_emulator_ensure` — boot a device, installing the SDK if needed *(fork)*
 
 </td>
 </tr>
 </table>
 
 <details>
-<summary><strong>253 tools — full reference</strong></summary>
+<summary><strong>258 tools — full reference</strong></summary>
 
 **AI Explore:** `page_summary`, `explore_actions`, `boundary_test`, `explore_report`
 
 **Launch & Connect:** `launch_app`, `scan_and_connect`, `connect_cdp`, `hot_reload`, `hot_restart`, `list_sessions`, `switch_session`, `close_session`, `disconnect`, `stop_app`
+
+**Android Emulator (fork):** `android_emulator_ensure`, `android_emulator_start`, `android_emulator_stop`, `android_emulator_list`, `android_emulator_delete`
 
 **Screen:** `screenshot`, `screenshot_region`, `screenshot_element`, `native_screenshot`, `inspect`, `inspect_interactive`, `snapshot`, `get_widget_tree`, `find_by_type`, `get_text_content`, `get_visible_text`
 
@@ -430,6 +456,114 @@ Then batch multiple actions in one call:
 **Debug:** `get_logs`, `get_errors`, `get_console_messages`, `get_network_requests`, `diagnose`, `diagnose_project`, `reset_app`
 
 </details>
+
+---
+
+<a id="android-emulator-lifecycle"></a>
+
+## 📱 Android Emulator Lifecycle (fork)
+
+Five tools that let an agent bring up an Android device on its own. All are
+available before any app connection exists.
+
+| Tool | What it does |
+| --- | --- |
+| `android_emulator_ensure` | One idempotent call for a booted, ready device |
+| `android_emulator_start` | Boot an existing emulator, optionally waiting for it |
+| `android_emulator_stop` | Shut one down, or all of them |
+| `android_emulator_list` | Emulators that are *defined*, running or not |
+| `android_emulator_delete` | Teardown, gated behind `confirm: true` |
+
+### The one call that matters
+
+`android_emulator_ensure` guarantees a usable device, whatever state the
+machine is in:
+
+- No Android SDK → installs command-line tools, platform tools, a system image and the emulator
+- No emulator defined → creates one (Pixel 6 Pro, API 34) with a device frame
+- Emulator not running → boots it
+- Waits for `sys.boot_completed`, then returns the serial
+
+```json
+{
+  "success": true,
+  "avd": "Pixel6Pro_API_34",
+  "serial": "emulator-5554",
+  "api_level": "34",
+  "abi": "arm64-v8a",
+  "already_running": false,
+  "provisioned": false,
+  "retried": false
+}
+```
+
+It is idempotent, so it is cheap to call at the start of every run — about a
+second when the device is already booted, with `already_running: true`. A warm
+boot is roughly 15–40 seconds. A first run downloads well over a GB and can
+take several minutes, so raise `timeout_seconds` on a cold machine.
+
+Failures come back structured rather than as an opaque exit code, and say what
+actually happened:
+
+```json
+{
+  "success": false,
+  "error": "The emulator process for 'Pixel6Pro_API_34' exited after 12s without finishing boot. Check that virtualization is available and the system image is intact.",
+  "avd": "Pixel6Pro_API_34"
+}
+```
+
+Stopping and starting an emulator back to back can leave the previous instance
+holding the AVD lock, which would otherwise make this an intermittent failure.
+`ensure` detects that case, waits for the stale process to clear and retries
+once, reporting `retried: true`.
+
+### Typical agent flow
+
+```
+android_emulator_ensure()                      -> serial emulator-5554
+launch_app(project_path: "...", device_id: "emulator-5554")
+inspect()                                      -> interactive elements
+tap(...) / enter_text(...) / screenshot()
+android_emulator_stop()                        -> clean up
+```
+
+Example prompts:
+
+> "Spin up an Android emulator and test the login flow."
+
+> "Make sure a device is running, then launch my app and screenshot the home screen."
+
+### `launch_app` fix
+
+`launch_app` was broken for every Flutter app. It read the VM Service URI that
+`flutter run` advertises as `http://127.0.0.1:PORT/TOKEN=/` and handed it
+straight to `vmServiceConnectUri`, which speaks WebSocket:
+
+```
+E303 Launch failed: Found VM Service URI but failed to connect:
+WebSocketException: Unsupported URL scheme 'http'
+```
+
+`connect_app` sidestepped this only by requiring you to supply a `ws://` URL, so
+nothing in the codebase converted between the two. The fork converts the scheme
+and appends the trailing `ws` path segment (`https` maps to `wss`), and is a
+no-op on a URI that is already `ws://`.
+
+### Implementation notes
+
+The tools shell out to `scripts/android-env`, a self-contained Bash CLI that
+handles SDK provisioning, AVD creation, skins and boot waiting. It is driven
+with `--json`, and can be used directly outside this server —
+see [jeremiahlukus/android-env](https://github.com/jeremiahlukus/android-env).
+
+The script is located next to the running executable, then at
+`~/.flutter-skill/scripts/`, then in the source checkout, then on `PATH` — so it
+resolves correctly from a compiled binary running in some other project's
+directory, which is the normal case.
+
+**Requirements:** Java (JDK 17+), `curl`, `unzip`, `git`. On Windows the script
+needs Git Bash available as `bash`.
 
 ---
 
