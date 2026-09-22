@@ -18,6 +18,25 @@ extension _AndroidEmulatorHandlers on FlutterMcpServer {
   String? _findAndroidEnv() {
     final candidates = <String>[];
 
+    // Next to a compiled executable. This is the case that matters in
+    // practice: the server usually runs with the current directory set to
+    // whichever project is being tested, not to this package.
+    try {
+      final exeDir = File(Platform.resolvedExecutable).parent.path;
+      candidates.add('$exeDir/scripts/android-env');
+      candidates.add('$exeDir/android-env');
+    } catch (_) {
+      // resolvedExecutable is always available in practice; be defensive.
+    }
+
+    // Stable install location, populated when the binary is installed.
+    final home =
+        Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'];
+    if (home != null) {
+      candidates.add('$home/.flutter-skill/scripts/android-env');
+    }
+
+    // Source checkout: bin/../scripts.
     try {
       final scriptPath = Platform.script.toFilePath();
       final projectRoot = Directory(scriptPath).parent.parent.path;
@@ -26,7 +45,7 @@ extension _AndroidEmulatorHandlers on FlutterMcpServer {
       // Platform.script is not always a file path (e.g. compiled snapshots).
     }
 
-    // Alongside this source file, for `dart run` from a checkout.
+    // Running from the package root.
     candidates.add('${Directory.current.path}/scripts/android-env');
 
     for (final c in candidates) {
@@ -241,10 +260,15 @@ extension _AndroidEmulatorHandlers on FlutterMcpServer {
               !l.startsWith('Available') &&
               !l.startsWith('No AVDs'))
           .toList();
+      final err = _stripAnsi(run['stderr'] as String? ?? '').trim();
       return {
         'success': run['success'] == true,
         'avds': avds,
         'count': avds.length,
+        // Without this a missing android-env script looked like "no emulators".
+        if (run['success'] != true)
+          'error': (run['error'] as String?) ??
+              (err.isNotEmpty ? err : 'android-env list failed'),
       };
     }
 

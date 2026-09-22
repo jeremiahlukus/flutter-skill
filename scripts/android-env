@@ -1296,7 +1296,7 @@ function do_ensure() {
     export ANDROID_ENV_YES=1
 
     local log="${TMPDIR:-/tmp}/android-env-ensure.$$.log"
-    local created=0 provisioned=0
+    local created=0 provisioned=0 retried=0
 
     # 1. SDK and at least one AVD.
     local have_avd=0
@@ -1341,6 +1341,24 @@ function do_ensure() {
     # 3. Booted.
     local serial code
     serial=$(wait_for_boot "$avd_name" "$timeout"); code=$?
+
+    # Code 3 means the emulator process died during boot. The usual cause is a
+    # previous instance still shutting down and holding the AVD lock, which is
+    # easy to hit when a test run stops and starts an emulator back to back.
+    # Wait for any stale process to clear, then try once more.
+    if [ "$code" -eq 3 ]; then
+        echo "Emulator exited during boot; waiting for any stale instance to clear..." >&2
+        local settle=0
+        while avd_is_running "$avd_name" && [ "$settle" -lt 30 ]; do
+            sleep 1
+            settle=$((settle + 1))
+        done
+        sleep 2
+        nohup "$EMULATOR_BIN" -avd "$avd_name" > /dev/null 2>&1 &
+        serial=$(wait_for_boot "$avd_name" "$timeout"); code=$?
+        [ "$code" -eq 0 ] && retried=1
+    fi
+
     if [ "$code" -ne 0 ]; then
         json_or_die "$as_json" "$(boot_failure_reason "$code" "$avd_name" "$timeout")" "$avd_name"
         rm -f "$WAIT_WAITED_FILE"
@@ -1353,10 +1371,11 @@ function do_ensure() {
     abi=$("$ADB_BIN" -s "$serial" shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r\n')
 
     if [ "$as_json" -eq 1 ]; then
-        printf '{"success":true,"avd":"%s","serial":"%s","api_level":"%s","abi":"%s","already_running":%s,"provisioned":%s}\n' \
+        printf '{"success":true,"avd":"%s","serial":"%s","api_level":"%s","abi":"%s","already_running":%s,"provisioned":%s,"retried":%s}\n' \
             "$avd_name" "$serial" "$api" "$abi" \
             "$([ "$was_running" -eq 1 ] && echo true || echo false)" \
-            "$([ "$provisioned" -eq 1 ] && echo true || echo false)"
+            "$([ "$provisioned" -eq 1 ] && echo true || echo false)" \
+            "$([ "$retried" -eq 1 ] && echo true || echo false)"
     else
         echo -e "${GREEN}✓ $avd_name ready${NC}"
         echo "  serial:    $serial"
